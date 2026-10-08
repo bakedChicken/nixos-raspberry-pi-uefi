@@ -1,0 +1,176 @@
+#+TITLE: nixos-raspberry-pi-uefi
+
+Boot NixOS on the Raspberry Pi 3 and 4 like on any other UEFI machine: UEFI firmware built from EDK2, systemd-boot or GRUB,
+NixOS generations and rollback, and the latest mainline kernel. One option opts a normal ~nixosConfiguration~ in;
+the same configuration also builds an image to write to the SD card.
+
+#+begin_src nix
+hardware.pi3.uefi.enable = true;
+#+end_src
+
+* Supported boards
+The options are named after the board generations, but each covers a whole SoC family: the boards in a family share
+the firmware and the boot chain and differ only in the mainline device tree Linux boots with.
+
+| Option              | SoC     | Boards                                         | Mainline device tree (~hardware.deviceTree.name~) |
+|---------------------+---------+------------------------------------------------+---------------------------------------------------|
+| ~hardware.pi3.uefi~ | BCM2837 | Raspberry Pi 3B (default)                      | ~broadcom/bcm2837-rpi-3-b.dtb~                    |
+|                     |         | Raspberry Pi 3B+                               | ~broadcom/bcm2837-rpi-3-b-plus.dtb~               |
+|                     |         | Raspberry Pi 3A+                               | ~broadcom/bcm2837-rpi-3-a-plus.dtb~               |
+|                     |         | Compute Module 3 (on the CM3 IO board)         | ~broadcom/bcm2837-rpi-cm3-io3.dtb~                |
+|                     |         | Raspberry Pi Zero 2 W                          | ~broadcom/bcm2837-rpi-zero-2-w.dtb~               |
+| ~hardware.pi4.uefi~ | BCM2711 | Raspberry Pi 4B (default)                      | ~broadcom/bcm2711-rpi-4-b.dtb~                    |
+|                     |         | Raspberry Pi 400                               | ~broadcom/bcm2711-rpi-400.dtb~                    |
+|                     |         | Compute Module 4 (on the CM4 IO board)         | ~broadcom/bcm2711-rpi-cm4-io.dtb~                 |
+
+For any board but the default, set the device tree:
+
+#+begin_src nix
+hardware.pi3.uefi.enable = true;
+hardware.deviceTree.name = "broadcom/bcm2837-rpi-3-b-plus.dtb";
+#+end_src
+
+Only the Raspberry Pi 3B has been tested.
+
+* Why
+The usual way to run NixOS on a Raspberry Pi is the nixpkgs SD image: the GPU firmware starts U-Boot, which reads
+~extlinux.conf~. That makes the Pi the odd one out next to UEFI machines, and on a Raspberry Pi 3 with a recent
+mainline kernel it can fail outright: after U-Boot has used the SD card, the mainline SD host driver may no longer
+initialise it (~sdhost-bcm2835: unexpected command 55 error~, ~mmc0: error -84 whilst initialising SD card~), and
+the root filesystem never appears.
+
+The [[https://github.com/pftf][Pi Firmware Task Force]] maintains EDK2 (TianoCore) UEFI firmware for the Pi. With it,
+a Pi boots exactly like a PC:
+
+#+begin_example
+GPU firmware (bootcode.bin, start.elf, config.txt)
+  └─ RPI_EFI.fd: UEFI firmware, built from EDK2
+       └─ systemd-boot or GRUB, from the EFI system partition
+            └─ Linux (mainline) with the mainline device tree
+#+end_example
+
+This flake packages that chain for NixOS:
++ builds ~RPI_EFI.fd~ from source, at the EDK2 commits the Pi Firmware Task Force releases are built from;
++ installs it with the GPU firmware and ~config.txt~ on the ESP through your boot loader, so every switch keeps them in
+  place;
++ boots Linux in device tree mode with the board's mainline device tree;
++ sets up the partition layout and builds an install image with ~systemd-repart~.
+
+* Usage
+Add the flake and opt in:
+
+#+begin_src nix
+{
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nixos-raspberry-pi-uefi = {
+      url = "github:bakedChicken/nixos-raspberry-pi-uefi";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+  };
+
+  outputs = {nixpkgs, nixos-raspberry-pi-uefi, ...}: {
+    nixosConfigurations.pi = nixpkgs.lib.nixosSystem {
+      modules = [
+        nixos-raspberry-pi-uefi.nixosModules.default
+        {
+          nixpkgs.hostPlatform = "aarch64-linux";
+          # The GPU firmware (raspberrypifw) is redistributable but unfree
+          nixpkgs.config.allowUnfree = true;
+          networking.hostName = "pi";
+          hardware.pi3.uefi.enable = true;
+          # Any EFI boot loader: systemd-boot, or GRUB with efiSupport
+          boot.loader.systemd-boot.enable = true;
+          # ... the rest of the system as usual
+        }
+      ];
+    };
+  };
+}
+#+end_src
+
+Build the image and write it to the SD card:
+
+#+begin_src sh
+nix build .#nixosConfigurations.pi.config.system.build.raspberryPiImage
+zstd -dc result | sudo dd of=/dev/sdX bs=4M conv=fsync status=progress
+#+end_src
+
+On first boot the root partition grows to fill the card. From then on, the Pi is updated like any other NixOS
+machine (~nixos-rebuild switch --target-host~, deploy-rs, colmena); ~raspberryPiImage~ is only needed to install.
+
+** Options
+Each family has its own namespace: ~hardware.pi3.uefi~ and ~hardware.pi4.uefi~ (see [[*Supported boards][Supported boards]]).
+
+| Option          | Default                       | Meaning                                                              |
+|-----------------+-------------------------------+----------------------------------------------------------------------|
+| ~enable~        | ~false~                       | Boot this board through UEFI and provide ~system.build.raspberryPiImage~ |
+| ~serialConsole~ | ~"ttyS1,115200n8"~            | Kernel console on the GPIO 14/15 UART, ~null~ for none               |
+| ~configTxt~     | the Pi Firmware Task Force's  | ~config.txt~ for the GPU firmware                                    |
+| ~rootDevice~    | ~"/dev/mmcblk0"~              | Disk the root partition grows on at first boot                       |
+
+Everything else is plain NixOS. The module only sets defaults (~mkDefault~), so ~hardware.deviceTree.name~,
+~fileSystems~ and the boot loader settings are overridden as usual. The image follows ~fileSystems."/".fsType~
+(~ext4~ unless set), for example:
+
+#+begin_src nix
+fileSystems."/".fsType = "btrfs";
+#+end_src
+
+* What the module does
++ *Firmware*: ~RPI_EFI.fd~ (built from EDK2), ~config.txt~, the GPU firmware and the board's vendor device trees
+  from nixpkgs' ~raspberrypifw~, installed on the ESP through the boot loader's ~extraFiles~.
++ *Boot loader*: yours to choose; enable ~boot.loader.systemd-boot~, or ~boot.loader.grub~ with ~efiSupport~ (GRUB is
+  untested). The module only sets ~boot.loader.efi.canTouchEfiVariables = false~: the firmware keeps its variables
+  in ~RPI_EFI.fd~, which every switch reinstalls.
++ *Kernel*: the kernel you configure (the module does not pin one); ~acpi=off~, so Linux uses the device tree, and a
+  serial console.
++ *Layout*: GPT with an ESP labelled ~esp~ (512 MiB, ~/boot~) and a root partition labelled ~root~.
++ *First boot of an image*: systemd-repart grows the root partition and filesystem, the image's store is made
+  read-only and registered with Nix.
++ *Image* (~system.build.raspberryPiImage~, zstd-compressed): built with ~image.repart~. For the first boot,
+  the ESP holds systemd-boot as the fallback boot loader and one unified kernel image (kernel, initrd,
+  command line, device tree); the first switch installs the configured boot loader. Each hostname gets its own disk and
+  partition UUIDs.
+
+** ~hardware.pi3~ (BCM2837): hybrid MBR
+The boot ROM of the BCM2837 boards only reads MBR partition tables. Its image keeps GPT for Linux and the boot loader and adds a
+hybrid MBR that lists the ESP as FAT32 (LBA), like disko's ~hybrid~ option does. systemd-repart keeps a hybrid MBR
+when it grows the root partition; ~growpart~ (~boot.growPartition~) does not, so do not enable it.
+
+** ~hardware.pi4~ (BCM2711)
+I have no Raspberry Pi 4, so I couldn't test it. The BCM2711 support follows the Pi Firmware Task Force's RPi4
+release (same EDK2 commits, ~config.txt~, ~start4.elf~ and overlays) and needs no hybrid MBR, as its EEPROM boot
+loader reads GPT. Reports and fixes are welcome.
+
+* Building on x86_64
+The firmware runs on aarch64. The flake builds it natively on an aarch64 machine and with nixpkgs' aarch64 cross
+compiler elsewhere (~nix build .#rpi3-uefi-firmware~ works on x86_64 too). The rest is an ordinary aarch64 NixOS
+system, built in one of the usual ways:
++ binfmt emulation (~boot.binfmt.emulatedSystems = ["aarch64-linux"];~ on the x86_64 machine); almost everything
+  comes from cache.nixos.org, little is emulated;
++ a remote aarch64 builder;
++ cross-compilation (~nixpkgs.buildPlatform~), which misses the binary cache.
+
+
+* Known issues
++ ~image.repart~ copies the Nix store with the write bit set
+  ([[https://github.com/NixOS/nixpkgs/issues/361903][nixpkgs#361903]]). The module makes the store read-only on
+  first boot, before registering it.
++ The UEFI firmware stores its settings in ~RPI_EFI.fd~ on the ESP; a NixOS switch reinstalls that file and resets
+  settings changed in the firmware menu. Change ~config.txt~ through ~configTxt~ instead.
++ The Pi 3 firmware bundles prebuilt Trusted Firmware-A binaries from ~edk2-non-osi~.
+
+* Development
++ ~nix flake check~ evaluates example systems for both boards, including their images.
++ ~nix build .#rpi3-uefi-firmware~ / ~.#rpi4-uefi-firmware~ builds the firmware.
++ ~nix fmt~ formats the tree.
+
+* Credits
++ [[https://github.com/pftf][Pi Firmware Task Force]] (Pete Batard and contributors) for the Raspberry Pi UEFI
+  firmware and its build.
++ [[https://github.com/tianocore][TianoCore]] for EDK2.
+
+* License
+MIT, see [[file:LICENSE][LICENSE]]. The firmware this flake builds is under EDK2's licenses (BSD-2-Clause-Patent, with
+BSD-3-Clause Trusted Firmware-A); the GPU firmware from ~raspberrypifw~ is redistributable but unfree.
