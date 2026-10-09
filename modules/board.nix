@@ -23,7 +23,21 @@ spec: {
     // lib.listToAttrs (map (f: lib.nameValuePair "overlays/${f}" "${gpuFirmware}/overlays/${f}") spec.overlays);
 
   toplevel = config.system.build.toplevel;
-  ukiFile = config.system.boot.loader.ukiFile;
+  # The image's boot entry, in the layout NixOS's systemd-boot installer manages: the first switch replaces it with
+  # the system's generations and removes these files (it garbage-collects nixos-*.conf entries and EFI/nixos)
+  imageBootFiles = {
+    "/EFI/nixos/image-kernel.efi" = "${config.boot.kernelPackages.kernel}/${config.system.boot.loader.kernelFile}";
+    "/EFI/nixos/image-initrd.efi" = "${config.system.build.initialRamdisk}/${config.system.boot.loader.initrdFile}";
+    "/EFI/nixos/image-devicetree.efi" = "${config.hardware.deviceTree.package}/${config.hardware.deviceTree.name}";
+    "/loader/entries/nixos-image.conf" = pkgs.writeText "nixos-image.conf" ''
+      title NixOS (installation image)
+      sort-key nixos
+      linux /EFI/nixos/image-kernel.efi
+      initrd /EFI/nixos/image-initrd.efi
+      devicetree /EFI/nixos/image-devicetree.efi
+      options init=${toplevel}/init ${toString config.boot.kernelParams}
+    '';
+  };
   efiArch = pkgs.stdenv.hostPlatform.efiArch;
   hostname = config.networking.hostName;
   rootFsType = config.fileSystems."/".fsType;
@@ -79,7 +93,41 @@ in {
       # The firmware keeps its variables in RPI_EFI.fd, which every switch reinstalls
       efi.canTouchEfiVariables = mkDefault false;
     };
-    hardware.deviceTree.name = mkDefault spec.deviceTree;
+    hardware.deviceTree = {
+      name = mkDefault spec.deviceTree;
+      # The mainline device tree starts the secondary CPUs with spin-table, but the UEFI firmware's Trusted Firmware-A
+      # holds them for PSCI. The firmware patches the device tree it passes on the same way; the boot loader replaces
+      # that one with the mainline device tree, so the patch is applied here too.
+      overlays = [
+        {
+          name = "raspberry-pi-uefi-psci";
+          dtsText = ''
+            /dts-v1/;
+            /plugin/;
+            / {
+              compatible = "${spec.soc}";
+              fragment@0 {
+                target-path = "/";
+                __overlay__ {
+                  psci {
+                    compatible = "arm,psci-1.0";
+                    method = "smc";
+                  };
+                };
+              };
+              ${lib.concatMapStrings (n: ''
+              fragment@${toString (n + 1)} {
+                target-path = "/cpus/cpu@${toString n}";
+                __overlay__ {
+                  enable-method = "psci";
+                };
+              };
+            '') (lib.range 0 3)}
+            };
+          '';
+        }
+      ];
+    };
     boot.kernelParams =
       # The UEFI firmware offers ACPI and a device tree; Linux on the Pi works best with the device tree
       ["acpi=off"]
@@ -121,14 +169,15 @@ in {
         wantedBy = ["initrd.target"];
         after = ["sysroot.mount"];
         requires = ["sysroot.mount"];
-        before = ["initrd-switch-root.target"];
+        # initrd.target, so the switch to the real root waits for it instead of stopping it
+        before = ["initrd.target"];
         unitConfig = {
           DefaultDependencies = false;
           ConditionPathExists = "/sysroot/nix-path-registration";
         };
         serviceConfig = {
           Type = "oneshot";
-          ExecStart = "${pkgs.findutils}/bin/find /sysroot/nix/store -mindepth 1 -maxdepth 1 -exec ${pkgs.coreutils}/bin/chmod -R a-w {} +";
+          ExecStart = "${pkgs.findutils}/bin/find /sysroot/nix/store -mindepth 1 -maxdepth 1 ! -type l -exec ${pkgs.coreutils}/bin/chmod -R a-w {} +";
         };
       };
       storePaths = [
@@ -148,8 +197,8 @@ in {
       fi
     '';
 
-    # The install image, only evaluated when built: a GPT disk with the ESP (systemd-boot for the first boot, one UKI with kernel,
-    # initrd, command line and device tree, and the firmware) and the root partition with the system closure
+    # The install image, only evaluated when built: a GPT disk with the ESP (systemd-boot and one boot entry for the first
+    # boot, and the firmware) and the root partition with the system closure
     image.repart = {
       enable = true;
       name = hostname;
@@ -159,8 +208,8 @@ in {
           contents =
             {
               "/EFI/BOOT/BOOT${lib.toUpper efiArch}.EFI".source = "${config.systemd.package}/lib/systemd/boot/efi/systemd-boot${efiArch}.efi";
-              "/EFI/Linux/${ukiFile}".source = "${config.system.build.uki}/${ukiFile}";
             }
+            // lib.mapAttrs (_: source: {inherit source;}) imageBootFiles
             // lib.mapAttrs' (path: source: lib.nameValuePair "/${path}" {inherit source;}) firmwareFiles;
           repartConfig = {
             Type = "esp";

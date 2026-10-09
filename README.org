@@ -125,13 +125,15 @@ fileSystems."/".fsType = "btrfs";
   in ~RPI_EFI.fd~, which every switch reinstalls.
 + *Kernel*: the kernel you configure (the module does not pin one); ~acpi=off~, so Linux uses the device tree, and a
   serial console.
++ *Device tree*: an overlay starts the secondary CPUs through PSCI, as the UEFI firmware does with the device tree it
+  passes on; the mainline device tree's spin-table would leave Linux with one CPU.
 + *Layout*: GPT with an ESP labelled ~esp~ (512 MiB, ~/boot~) and a root partition labelled ~root~.
 + *First boot of an image*: systemd-repart grows the root partition and filesystem, the image's store is made
   read-only and registered with Nix.
 + *Image* (~system.build.raspberryPiImage~, zstd-compressed): built with ~image.repart~. For the first boot,
-  the ESP holds systemd-boot as the fallback boot loader and one unified kernel image (kernel, initrd,
-  command line, device tree); the first switch installs the configured boot loader. Each hostname gets its own disk and
-  partition UUIDs.
+  the ESP holds systemd-boot as the fallback boot loader and one boot entry in the layout NixOS's systemd-boot
+  installer manages; the first switch installs the configured boot loader and replaces that entry with the system's
+  generations. Each hostname gets its own disk and partition UUIDs.
 
 ** ~hardware.pi3~ (BCM2837): hybrid MBR
 The boot ROM of the BCM2837 boards only reads MBR partition tables. Its image keeps GPT for Linux and the boot loader and adds a

@@ -10,6 +10,8 @@ in {
       description = "BCM2837 boards: Raspberry Pi 3B, 3B+, 3A+, Compute Module 3 and Zero 2 W";
       # Mainline device tree for the 3B; other boards set hardware.deviceTree.name
       deviceTree = "broadcom/bcm2837-rpi-3-b.dtb";
+      # Matches every board of the family; device tree overlays apply by it
+      soc = "brcm,bcm2837";
       # Loaded by the GPU firmware before UEFI
       gpuFirmware = [
         "bootcode.bin"
@@ -42,6 +44,7 @@ in {
       # The BCM2711 family; not only the Pi 4
       description = "BCM2711 boards: Raspberry Pi 4B, 400 and Compute Module 4";
       deviceTree = "broadcom/bcm2711-rpi-4-b.dtb";
+      soc = "brcm,bcm2711";
       gpuFirmware = [
         "start4.elf"
         "fixup4.dat"
